@@ -19,6 +19,8 @@ use Scout\Solr\Client;
 use Scout\Solr\ClientInterface;
 use Scout\Solr\Events\AfterSelect;
 use Scout\Solr\Events\BeforeSelect;
+use Solarium\Core\Client\Endpoint;
+use Solarium\Core\Query\QueryInterface;
 use Solarium\Core\Query\Result\ResultInterface;
 use Solarium\QueryType\Select\Result\Document;
 use Solarium\QueryType\Select\Result\Result;
@@ -32,11 +34,8 @@ class SolrEngine extends Engine
     private Repository $config;
     private Dispatcher $events;
 
-    public function __construct(
-        ClientInterface $client,
-        Repository $config,
-        Dispatcher $events
-    ) {
+    public function __construct(ClientInterface $client, Repository $config, Dispatcher $events)
+    {
         $this->client = $client;
         $this->config = $config;
         $this->events = $events;
@@ -75,14 +74,13 @@ class SolrEngine extends Engine
                 ->all()
         );
         $delete->addCommit();
-
         $this->client->update($delete, $this->getEndpointFromConfig($models->first()->searchableAs()));
     }
 
     public function search(Builder $builder): Result
     {
         return $this->performSearch($builder, array_filter([
-            'filters' => $this->filters($builder),
+            'whereIns' => $this->filtersWhereIns($builder),
             'limit' => $builder->limit,
         ]));
     }
@@ -90,7 +88,7 @@ class SolrEngine extends Engine
     public function paginate(Builder $builder, $perPage, $page)
     {
         return $this->performSearch($builder, array_filter([
-            'filters' => $this->filters($builder),
+            'whereIns' => $this->filtersWhereIns($builder),
             'limit' => (int) $perPage,
             'offset' => ($page - 1) * $perPage,
         ]));
@@ -122,7 +120,7 @@ class SolrEngine extends Engine
 
         return $model->getScoutModelsByIds($builder, $objectIds)
             ->filter(function ($model) use ($objectIds) {
-                return in_array($model->getScoutKey(), $objectIds);
+                return in_array($model->getScoutKey(), $objectIds, false);
             })->sortBy(function ($model) use ($objectIdPositions) {
                 return $objectIdPositions[$model->getScoutKey()];
             })->values();
@@ -148,7 +146,7 @@ class SolrEngine extends Engine
         return $model->getScoutModelsByIds($builder, $objectIds)
             ->cursor()
             ->filter(function ($model) use ($objectIds) {
-                return in_array($model->getScoutKey(), $objectIds);
+                return in_array($model->getScoutKey(), $objectIds, false);
             })->sortBy(function ($model) use ($objectIdPositions) {
                 return $objectIdPositions[$model->getScoutKey()];
             })->values();
@@ -174,12 +172,28 @@ class SolrEngine extends Engine
 
     public function createIndex($name, array $options = [])
     {
-        return $this->client->createCore($name);
+        $coreAdminQuery = $this->client->createCoreAdmin();
+
+        $action = $coreAdminQuery->createCreate();
+        $action->setCore($name);
+        $action->setConfigSet($this->config->get('scout-solr.create.config_set'));
+
+        $coreAdminQuery->setAction($action);
+        return $this->client->coreAdmin($coreAdminQuery, $this->getEndpointFromConfig($name));
     }
 
     public function deleteIndex($name)
     {
-        return $this->client->deleteCore($name);
+        $coreAdminQuery = $this->client->createCoreAdmin();
+
+        $action = $coreAdminQuery->createUnload();
+        $action->setCore($name);
+        $action->setDeleteIndex($this->config->get('scout-solr.unload.delete_index'));
+        $action->setDeleteDataDir($this->config->get('scout-solr.unload.delete_data_dir'));
+        $action->setDeleteInstanceDir($this->config->get('scout-solr.unload.delete_instance_dir'));
+
+        $coreAdminQuery->setAction($action);
+        return $this->client->coreAdmin($coreAdminQuery, $this->getEndpointFromConfig($name));
     }
 
     protected function performSearch(Builder $builder, array $options = []): Result
@@ -196,8 +210,11 @@ class SolrEngine extends Engine
         }
 
         $query = $this->client->createSelect();
-        if (array_key_exists('filters', $options)) {
-            $query->setQuery($options['filters']);
+
+        $this->filters($query, $builder);
+
+        if (array_key_exists('whereIns', $options)) {
+            $query->setQuery($options['whereIns']);
         } else {
             $query->setQuery($builder->query);
         }
@@ -218,12 +235,22 @@ class SolrEngine extends Engine
         return $result;
     }
 
-    protected function filters(Builder $builder): string
+    protected function filters(QueryInterface $query, Builder $builder)
     {
-        $filters = collect($builder->wheres)->map(function ($value, $key) {
-            return sprintf('%s:%s', $key, $value);
-        });
+        if (is_array($builder->wheres)) {
+            $wheres = collect($builder->wheres)->mapWithKeys(function ($value, $key) {
+                return [$key => sprintf('%s:"%s"', $key, $value)];
+            })->all();
 
+            foreach ($wheres as $key => $value) {
+                $query->createFilterQuery($key)->setQuery($value);
+            }
+        }
+    }
+
+    protected function filtersWhereIns(Builder $builder): string
+    {
+        $filters = new Collection();
         foreach ($builder->whereIns as $key => $values) {
             $filters->push(sprintf('%s:(%s)', $key, collect($values)->map(function ($value) {
                 return $value;
@@ -231,6 +258,15 @@ class SolrEngine extends Engine
         }
 
         return $filters->values()->implode(' AND ');
+    }
+
+    public function getEndpointFromConfig(string $name): ?Endpoint
+    {
+        if ($this->config->get('scout-solr.endpoints.' . $name) === null) {
+            return null;
+        }
+
+        return new Endpoint($this->config->get('scout-solr.endpoints.' . $name));
     }
 
     /**
